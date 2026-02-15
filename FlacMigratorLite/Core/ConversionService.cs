@@ -31,7 +31,7 @@ public class ConversionService
             Directory.CreateDirectory(targetDir);
         }
 
-        var tempPath = track.TargetPath + ".part";
+        var tempPath = track.TargetPath + ".part.mp3";
         if (File.Exists(tempPath))
         {
             File.Delete(tempPath);
@@ -48,6 +48,7 @@ public class ConversionService
             "-c:v copy",
             "-id3v2_version 3",
             "-write_id3v1 1",
+            "-f mp3",
             $"\"{tempPath}\""
         });
 

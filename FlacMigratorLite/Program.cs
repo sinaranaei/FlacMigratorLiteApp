@@ -13,6 +13,7 @@ if (args.Length < 2)
 var sourceDirectory = Path.GetFullPath(args[0]);
 var targetDirectory = Path.GetFullPath(args[1]);
 var deleteVerified = args.Any(arg => string.Equals(arg, "--delete", StringComparison.OrdinalIgnoreCase));
+var retryFailed = args.Any(arg => string.Equals(arg, "--retry-failed", StringComparison.OrdinalIgnoreCase));
 
 if (!Directory.Exists(sourceDirectory))
 {
@@ -72,10 +73,18 @@ foreach (var track in tracks)
 		}
 		else if (entry.Status == TrackStatus.Failed)
 		{
-			track.Status = TrackStatus.Failed;
-			track.LastError = entry.LastError;
+			if (!retryFailed)
+			{
+				track.Status = TrackStatus.Failed;
+				track.LastError = entry.LastError;
+			}
 		}
 	}
+}
+
+if (retryFailed)
+{
+	logger.Info("Retrying failed tracks from previous run.");
 }
 
 var estimation = estimator.Calculate(tracks, null);
@@ -161,7 +170,7 @@ logger.Info("Migration complete.");
 
 void PrintUsage()
 {
-	Console.WriteLine("Usage: FlacMigratorLite <sourceDir> <targetDir> [--delete]");
+	Console.WriteLine("Usage: FlacMigratorLite <sourceDir> <targetDir> [--delete] [--retry-failed]");
 }
 
 void PrintSummary(int totalFiles, EstimationResult estimation)
