@@ -25,36 +25,124 @@ public class ScannerService
             .Where(path => path.EndsWith(".flac", StringComparison.OrdinalIgnoreCase));
 
         var fileList = files.ToList();
-        for (var i = 0; i < fileList.Count; i++)
+        var tracksLock = new object();
+        var maxParallelProbes = Math.Max(2, Environment.ProcessorCount / 2); // Use 1/2 of CPU cores for aggressive probing
+
+        // Batch files for more efficient probing (8 files per batch)
+        const int FilesPerBatch = 8;
+        var batches = fileList
+            .Select((file, index) => (file, batch: index / FilesPerBatch))
+            .GroupBy(x => x.batch)
+            .Select(g => g.Select(x => x.file).ToList())
+            .ToList();
+
+        var progressLock = new object();
+        var processedCount = 0;
+
+        var probeWorker = new WorkerQueue<List<string>>(
+            maxParallelProbes,
+            async (fileBatch, ct) =>
+            {
+                var durations = await BatchProbeDurationAsync(config, fileBatch, ct).ConfigureAwait(false);
+
+                for (var i = 0; i < fileBatch.Count; i++)
+                {
+                    var file = fileBatch[i];
+                    var duration = durations.ContainsKey(file) ? durations[file] : TimeSpan.Zero;
+                    var relative = Path.GetRelativePath(config.SourceDirectory, file);
+                    var target = Path.Combine(config.TargetDirectory, Path.ChangeExtension(relative, ".mp3"));
+                    var info = new FileInfo(file);
+                    var mp3Estimate = EstimateMp3Bytes(duration, config.Mp3BitrateKbps);
+
+                    var trackInfo = new TrackInfo
+                    {
+                        SourcePath = file,
+                        RelativePath = relative,
+                        TargetPath = target,
+                        SizeBytes = info.Length,
+                        Duration = duration,
+                        Mp3SizeEstimateBytes = mp3Estimate,
+                        Status = duration == TimeSpan.Zero ? TrackStatus.Failed : TrackStatus.Pending,
+                        LastError = duration == TimeSpan.Zero ? "Duration probe failed." : null
+                    };
+
+                    lock (tracksLock)
+                    {
+                        tracks.Add(trackInfo);
+                    }
+
+                    lock (progressLock)
+                    {
+                        processedCount++;
+                        if (processedCount % 10 == 0 || processedCount == fileList.Count)
+                        {
+                            progressCallback?.Invoke(processedCount, relative);
+                        }
+                    }
+                }
+            },
+            _logger
+        );
+
+        await probeWorker.ProcessAsync(batches, cancellationToken).ConfigureAwait(false);
+
+        return tracks;
+    }
+
+    private async Task<Dictionary<string, TimeSpan>> BatchProbeDurationAsync(MigrationConfig config, List<string> filePaths, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<string, TimeSpan>();
+
+        if (filePaths.Count == 0)
         {
-            var file = fileList[i];
-            var duration = await ProbeDurationAsync(config, file, cancellationToken).ConfigureAwait(false);
-            var relative = Path.GetRelativePath(config.SourceDirectory, file);
-            var target = Path.Combine(config.TargetDirectory, Path.ChangeExtension(relative, ".mp3"));
-            var info = new FileInfo(file);
-            var mp3Estimate = EstimateMp3Bytes(duration, config.Mp3BitrateKbps);
+            return result;
+        }
 
-            tracks.Add(new TrackInfo
-            {
-                SourcePath = file,
-                RelativePath = relative,
-                TargetPath = target,
-                SizeBytes = info.Length,
-                Duration = duration,
-                Mp3SizeEstimateBytes = mp3Estimate,
-                Status = duration == TimeSpan.Zero ? TrackStatus.Failed : TrackStatus.Pending,
-                LastError = duration == TimeSpan.Zero ? "Duration probe failed." : null
-            });
+        // Build ffprobe command with multiple input files
+        var inputArgs = string.Join(" ", filePaths.Select(f => $"\"{f}\""));
+        var args = $"-v error -show_entries format=filename,duration -of default=noprint_wrappers=1:nokey=1 {inputArgs}";
 
-            // Report progress every 10 files or at the end
-            if (i % 10 == 0 || i == fileList.Count - 1)
+        var probeResult = await _runner.RunAsync(config.FfprobePath, args, null, config.FfprobeTimeoutSeconds * 2, cancellationToken).ConfigureAwait(false);
+
+        if (!probeResult.IsSuccess)
+        {
+            // Fallback to individual probes if batch fails
+            foreach (var filePath in filePaths)
             {
-                progressCallback?.Invoke(i + 1, relative);
+                var duration = await ProbeDurationAsync(config, filePath, cancellationToken).ConfigureAwait(false);
+                result[filePath] = duration;
+            }
+            return result;
+        }
+
+        // Parse batch output: alternating filename and duration
+        var lines = probeResult.StdOut.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+        for (var i = 0; i < lines.Length - 1; i += 2)
+        {
+            var fileLine = lines[i].Trim();
+            var durationLine = lines[i + 1].Trim();
+
+            // Match filename to original path (handle path variations)
+            var matchedFile = filePaths.FirstOrDefault(f => 
+                f.EndsWith(fileLine, StringComparison.OrdinalIgnoreCase) || 
+                fileLine.Contains(Path.GetFileName(f), StringComparison.OrdinalIgnoreCase));
+
+            if (matchedFile != null && double.TryParse(durationLine, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds) && seconds > 0)
+            {
+                result[matchedFile] = TimeSpan.FromSeconds(seconds);
             }
         }
 
-        _logger.Info($"Found {tracks.Count} FLAC files.");
-        return tracks;
+        // Fallback for any files not found in batch output
+        foreach (var filePath in filePaths)
+        {
+            if (!result.ContainsKey(filePath))
+            {
+                result[filePath] = await ProbeDurationAsync(config, filePath, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        return result;
     }
 
     private async Task<TimeSpan> ProbeDurationAsync(MigrationConfig config, string filePath, CancellationToken cancellationToken)

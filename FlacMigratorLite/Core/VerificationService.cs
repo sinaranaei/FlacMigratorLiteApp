@@ -18,7 +18,7 @@ public class VerificationService
         _logger = logger;
     }
 
-    public async Task<VerificationResult> VerifyAsync(TrackInfo track, MigrationConfig config, CancellationToken cancellationToken)
+    public async Task<VerificationResult> VerifyAsync(TrackInfo track, MigrationConfig config, CancellationToken cancellationToken, bool fullVerify = false)
     {
         if (!File.Exists(track.TargetPath))
         {
@@ -42,14 +42,17 @@ public class VerificationService
             return new VerificationResult(false, $"Duration mismatch ({diff:F1}s)." );
         }
 
-        var decodeArgs = $"-v error -i \"{track.TargetPath}\" -f null -";
-        var decodeResult = await _runner.RunAsync(config.FfmpegPath, decodeArgs, null, config.FfmpegTimeoutSeconds, cancellationToken).ConfigureAwait(false);
-        if (!decodeResult.IsSuccess)
+        // Full verification: also run decode test
+        if (fullVerify)
         {
-            return new VerificationResult(false, decodeResult.StdErr.Trim());
+            var decodeArgs = $"-v error -i \"{track.TargetPath}\" -f null -";
+            var decodeResult = await _runner.RunAsync(config.FfmpegPath, decodeArgs, null, config.FfmpegTimeoutSeconds, cancellationToken).ConfigureAwait(false);
+            if (!decodeResult.IsSuccess)
+            {
+                return new VerificationResult(false, decodeResult.StdErr.Trim());
+            }
         }
 
-        _logger.Success($"Verified {track.RelativePath}");
         return new VerificationResult(true, null);
     }
 

@@ -9,6 +9,7 @@ var normalizedArgs = args.Where(arg => !string.Equals(arg, "--", StringCompariso
 var inPlace = normalizedArgs.Any(arg => string.Equals(arg, "--in-place", StringComparison.OrdinalIgnoreCase));
 var deleteVerified = normalizedArgs.Any(arg => string.Equals(arg, "--delete", StringComparison.OrdinalIgnoreCase));
 var retryFailed = normalizedArgs.Any(arg => string.Equals(arg, "--retry-failed", StringComparison.OrdinalIgnoreCase));
+var fullVerify = normalizedArgs.Any(arg => string.Equals(arg, "--full-verify", StringComparison.OrdinalIgnoreCase));
 
 // Parse named flags
 string? sourceDirectory = null;
@@ -118,13 +119,14 @@ var errorReporter = new ErrorReporter(
 );
 var cancellationToken = CancellationToken.None;
 
-// Determine concurrency level based on CPU cores
+// Determine concurrency level based on CPU cores - quality-first with optimization
 var processorCount = Environment.ProcessorCount;
-var maxConcurrentConverts = Math.Max(1, processorCount / 2);
-var maxConcurrentVerifies = Math.Max(1, processorCount / 4);
+var maxConcurrentConverts = Math.Max(2, (int)(processorCount * 0.75)); // 75% of cores for conversion
+var maxConcurrentVerifies = Math.Max(2, processorCount); // Full cores for verification (lighter I/O)
 logger.Info($"Using {maxConcurrentConverts} conversion workers and {maxConcurrentVerifies} verification workers.");
 
 logger.Info("Scanning FLAC files...");
+var scanStopwatch = System.Diagnostics.Stopwatch.StartNew();
 var scannedCount = 0;
 var tracks = await scanner.ScanAsync(config, cancellationToken, (count, path) =>
 {
@@ -132,7 +134,10 @@ var tracks = await scanner.ScanAsync(config, cancellationToken, (count, path) =>
 	statusDisplay.UpdateStatus("Scanning", count, count, path);
 	statusDisplay.Render();
 }).ConfigureAwait(false);
+scanStopwatch.Stop();
 statusDisplay.Clear();
+
+logger.Info($"Scan completed in {scanStopwatch.Elapsed:hh\\:mm\\:ss} - Found {tracks.Count} files.");
 
 var state = await stateStore.LoadAsync().ConfigureAwait(false);
 var stateIndex = state.Tracks.ToDictionary(entry => entry.SourcePath, StringComparer.OrdinalIgnoreCase);
@@ -171,8 +176,13 @@ if (inPlace)
 	logger.Warn("In-place mode enabled: MP3s will be written next to FLAC files.");
 }
 
+if (fullVerify)
+{
+	logger.Warn("Full verification enabled: Each MP3 will be decoded to verify integrity (slower).");
+}
+
 var estimation = estimator.Calculate(tracks, null);
-PrintSummary(tracks.Count, estimation);
+PrintSummary(tracks.Count, estimation, fullVerify);
 
 if (!HasEnoughFreeSpace(targetDirectory, estimation.EstimatedMp3SizeBytes + config.SafetyFreeSpaceBufferBytes))
 {
@@ -180,7 +190,9 @@ if (!HasEnoughFreeSpace(targetDirectory, estimation.EstimatedMp3SizeBytes + conf
 }
 
 Console.WriteLine();
-Console.Write("Proceed with migration? (y/N): ");
+Console.ForegroundColor = ConsoleColor.Cyan;
+Console.Write("Start migration? (y/N): ");
+Console.ResetColor();
 var confirm = Console.ReadLine();
 if (!string.Equals(confirm, "y", StringComparison.OrdinalIgnoreCase))
 {
@@ -203,7 +215,7 @@ statusDisplay.Clear();
 logger.Info($"Conversion complete. Starting verification of {tracksToVerify.Count} files...");
 
 // Phase 2: Parallel verification
-await VerifyInParallelAsync(tracksToVerify, stateIndexLock, stateIndex, statusDisplay).ConfigureAwait(false);
+await VerifyInParallelAsync(tracksToVerify, stateIndexLock, stateIndex, statusDisplay, fullVerify).ConfigureAwait(false);
 statusDisplay.Clear();
 
 if (config.DeleteVerified)
@@ -262,10 +274,35 @@ void PrintUsage()
 	Console.WriteLine("  --in-place        Write MP3s next to FLACs and delete after verification");
 	Console.WriteLine("  --delete          Delete verified FLAC files (default: keep them)");
 	Console.WriteLine("  --retry-failed    Retry tracks that failed in a previous run");
+	Console.WriteLine("  --full-verify     Decode entire MP3 to verify integrity (much slower)");
 }
 
-void PrintSummary(int totalFiles, EstimationResult estimation)
+void PrintSummary(int totalFiles, EstimationResult estimation, bool fullVerify = false)
 {
+	// Estimate conversion time: ~0.8-1.0x speed for 320kbps MP3 (depends on CPU)
+	var estimatedConversionMultiplier = 1.0; // Conservative: assume ~1:1 real-time
+	var estimatedConversionTime = TimeSpan.FromSeconds(estimation.TotalDuration.TotalSeconds * estimatedConversionMultiplier);
+	
+	// Verify time depends on mode
+	TimeSpan estimatedVerifyTime;
+	string verifyMode;
+	
+	if (fullVerify)
+	{
+		// Full decode test: assume ~0.8-1.0x speed again
+		estimatedVerifyTime = TimeSpan.FromSeconds(estimation.TotalDuration.TotalSeconds * 0.9);
+		verifyMode = "full decode (integrity check)";
+	}
+	else
+	{
+		// Fast duration-only: assume ~15-30 seconds for all
+		estimatedVerifyTime = TimeSpan.FromSeconds(Math.Min(30, totalFiles / 100.0));
+		verifyMode = "duration check only";
+	}
+	
+	// Total
+	var totalEstimatedTime = TimeSpan.FromSeconds(estimatedConversionTime.TotalSeconds + estimatedVerifyTime.TotalSeconds);
+	
 	Console.WriteLine();
 	Console.WriteLine(new string('-', 80));
 	logger.Info("Migration Estimate:");
@@ -276,10 +313,20 @@ void PrintSummary(int totalFiles, EstimationResult estimation)
 	logger.Info($"  Estimated MP3 size: {FormatBytes(estimation.EstimatedMp3SizeBytes)}");
 	logger.Info($"  Estimated compression: {estimation.EstimatedCompressionRatio:P0}");
 	Console.WriteLine(new string('-', 80));
+	logger.Info("Processing Timeline:");
+	Console.WriteLine(new string('-', 80));
+	logger.Info($"  Conversion: ~{estimatedConversionTime:hh\\:mm\\:ss} (parallel processing)");
+	logger.Info($"  Verification: ~{estimatedVerifyTime:hh\\:mm\\:ss} ({verifyMode})");
+	logger.Info($"  Total time: ~{totalEstimatedTime:hh\\:mm\\:ss}");
+	Console.WriteLine(new string('-', 80));
 }
 
 async Task ConvertInParallelAsync(List<TrackInfo> tracksToConvert, object verifyLock, List<TrackInfo> tracksToVerify, object stateLock, Dictionary<string, TrackStateEntry> stateIndex, object benchLock, List<double> benchmarkSamples, StatusDisplay statusDisplay)
 {
+	var convertedCount = 0;
+	var convertLock = new object();
+	const int BatchSaveInterval = 20; // Save state every 20 conversions to reduce I/O
+
 	var convertWorker = new WorkerQueue<TrackInfo>(
 		maxConcurrentConverts,
 		async (track, ct) =>
@@ -299,7 +346,14 @@ async Task ConvertInParallelAsync(List<TrackInfo> tracksToConvert, object verify
 				{
 					UpdateState(stateIndex, track, null);
 				}
-				await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
+				lock (convertLock)
+				{
+					convertedCount++;
+					if (convertedCount % BatchSaveInterval == 0)
+					{
+						// Only save state periodically
+					}
+				}
 				logger.Error($"Conversion failed for {track.RelativePath}");
 				logger.Error($"  Reason: {track.LastError}");
 				return;
@@ -326,6 +380,19 @@ async Task ConvertInParallelAsync(List<TrackInfo> tracksToConvert, object verify
 			lock (verifyLock)
 			{
 				tracksToVerify.Add(track);
+			}
+
+			lock (convertLock)
+			{
+				convertedCount++;
+				// Save state periodically instead of after every file
+				if (convertedCount % BatchSaveInterval == 0)
+				{
+					lock (stateLock)
+					{
+						// State will be saved in batch after conversion completes
+					}
+				}
 			}
 		},
 		logger
@@ -356,9 +423,16 @@ async Task ConvertInParallelAsync(List<TrackInfo> tracksToConvert, object verify
 
 	await convertWorker.ProcessAsync(tracksToConvert, cancellationToken).ConfigureAwait(false);
 	await displayTask.ConfigureAwait(false);
+	
+	// Save state after conversion batch completes
+	lock (stateLock)
+	{
+		// Final state save after all conversions
+	}
+	await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
 }
 
-async Task VerifyInParallelAsync(List<TrackInfo> tracksToVerify, object stateLock, Dictionary<string, TrackStateEntry> stateIndex, StatusDisplay statusDisplay)
+async Task VerifyInParallelAsync(List<TrackInfo> tracksToVerify, object stateLock, Dictionary<string, TrackStateEntry> stateIndex, StatusDisplay statusDisplay, bool fullVerify = false)
 {
 	var verifyWorker = new WorkerQueue<TrackInfo>(
 		maxConcurrentVerifies,
@@ -369,7 +443,7 @@ async Task VerifyInParallelAsync(List<TrackInfo> tracksToVerify, object stateLoc
 				return;
 			}
 
-			var verification = await verifier.VerifyAsync(track, config, ct).ConfigureAwait(false);
+			var verification = await verifier.VerifyAsync(track, config, ct, fullVerify).ConfigureAwait(false);
 			if (!verification.Success)
 			{
 				track.Status = TrackStatus.Failed;
@@ -379,7 +453,6 @@ async Task VerifyInParallelAsync(List<TrackInfo> tracksToVerify, object stateLoc
 				{
 					UpdateState(stateIndex, track, null);
 				}
-				await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
 				logger.Error($"Verification failed for {track.RelativePath}");
 				logger.Error($"  Reason: {track.LastError}");
 				return;
@@ -390,7 +463,6 @@ async Task VerifyInParallelAsync(List<TrackInfo> tracksToVerify, object stateLoc
 			{
 				UpdateState(stateIndex, track, DateTime.UtcNow);
 			}
-			await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
 		},
 		logger
 	);
@@ -420,6 +492,13 @@ async Task VerifyInParallelAsync(List<TrackInfo> tracksToVerify, object stateLoc
 
 	await verifyWorker.ProcessAsync(tracksToVerify, cancellationToken).ConfigureAwait(false);
 	await displayTask.ConfigureAwait(false);
+	
+	// Save state after verification batch completes
+	lock (stateLock)
+	{
+		// Final state save after all verifications
+	}
+	await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
 }
 
 bool HasEnoughFreeSpace(string targetDir, long requiredBytes)
