@@ -3,17 +3,64 @@ using FlacMigratorLite.Infrastructure;
 using FlacMigratorLite.Models;
 
 var logger = new Logger();
+var statusDisplay = new StatusDisplay(logger);
 
-if (args.Length < 2)
+var normalizedArgs = args.Where(arg => !string.Equals(arg, "--", StringComparison.Ordinal)).ToArray();
+var inPlace = normalizedArgs.Any(arg => string.Equals(arg, "--in-place", StringComparison.OrdinalIgnoreCase));
+var deleteVerified = normalizedArgs.Any(arg => string.Equals(arg, "--delete", StringComparison.OrdinalIgnoreCase));
+var retryFailed = normalizedArgs.Any(arg => string.Equals(arg, "--retry-failed", StringComparison.OrdinalIgnoreCase));
+
+// Parse named flags
+string? sourceDirectory = null;
+string? targetDirectory = null;
+
+for (int i = 0; i < normalizedArgs.Length; i++)
 {
-	PrintUsage();
-	return;
+	if (string.Equals(normalizedArgs[i], "--source", StringComparison.OrdinalIgnoreCase) && i + 1 < normalizedArgs.Length)
+	{
+		sourceDirectory = normalizedArgs[++i];
+	}
+	else if (string.Equals(normalizedArgs[i], "--target", StringComparison.OrdinalIgnoreCase) && i + 1 < normalizedArgs.Length)
+	{
+		targetDirectory = normalizedArgs[++i];
+	}
 }
 
-var sourceDirectory = Path.GetFullPath(args[0]);
-var targetDirectory = Path.GetFullPath(args[1]);
-var deleteVerified = args.Any(arg => string.Equals(arg, "--delete", StringComparison.OrdinalIgnoreCase));
-var retryFailed = args.Any(arg => string.Equals(arg, "--retry-failed", StringComparison.OrdinalIgnoreCase));
+// Fall back to positional args if named flags not provided
+var positionalArgs = normalizedArgs
+	.Where(arg => !arg.StartsWith("--"))
+	.Where(arg => !arg.StartsWith("-"))
+	.ToArray();
+
+if (string.IsNullOrEmpty(sourceDirectory))
+{
+	if (positionalArgs.Length < 1)
+	{
+		PrintUsage();
+		return;
+	}
+	sourceDirectory = positionalArgs[0];
+}
+
+if (string.IsNullOrEmpty(targetDirectory) && !inPlace)
+{
+	if (positionalArgs.Length < 2)
+	{
+		PrintUsage();
+		return;
+	}
+	targetDirectory = positionalArgs[1];
+}
+
+sourceDirectory = Path.GetFullPath(sourceDirectory);
+if (inPlace)
+{
+	targetDirectory = sourceDirectory;
+}
+else if (!string.IsNullOrEmpty(targetDirectory))
+{
+	targetDirectory = Path.GetFullPath(targetDirectory);
+}
 
 if (!Directory.Exists(sourceDirectory))
 {
@@ -21,15 +68,30 @@ if (!Directory.Exists(sourceDirectory))
 	return;
 }
 
-if (sourceDirectory.Equals(targetDirectory, StringComparison.OrdinalIgnoreCase))
+if (!inPlace)
 {
-	logger.Error("Target directory must be different from source.");
-	return;
+	if (string.IsNullOrEmpty(targetDirectory))
+	{
+		logger.Error("Target directory is required when not in in-place mode.");
+		return;
+	}
+
+	if (sourceDirectory.Equals(targetDirectory, StringComparison.OrdinalIgnoreCase))
+	{
+		logger.Error("Target directory must be different from source.");
+		return;
+	}
+
+	if (targetDirectory.StartsWith(sourceDirectory, StringComparison.OrdinalIgnoreCase))
+	{
+		logger.Error("Target directory cannot be inside the source directory.");
+		return;
+	}
 }
 
-if (targetDirectory.StartsWith(sourceDirectory, StringComparison.OrdinalIgnoreCase))
+if (string.IsNullOrEmpty(targetDirectory))
 {
-	logger.Error("Target directory cannot be inside the source directory.");
+	logger.Error("Target directory path is null or empty.");
 	return;
 }
 
@@ -49,15 +111,32 @@ var estimator = new EstimationService();
 var converter = new ConversionService(runner, logger);
 var verifier = new VerificationService(runner, logger);
 var cleanup = new CleanupService(logger);
-var stateStore = new StateStore(config.StateFilePath, logger);
-
+var stateStore = new AtomicStateStore(config.StateFilePath, logger);
+var errorReporter = new ErrorReporter(
+    Path.Combine(targetDirectory, "migration_errors.log"),
+    logger
+);
 var cancellationToken = CancellationToken.None;
 
-logger.Info("Scanning FLAC files...");
-var tracks = await scanner.ScanAsync(config, cancellationToken).ConfigureAwait(false);
+// Determine concurrency level based on CPU cores
+var processorCount = Environment.ProcessorCount;
+var maxConcurrentConverts = Math.Max(1, processorCount / 2);
+var maxConcurrentVerifies = Math.Max(1, processorCount / 4);
+logger.Info($"Using {maxConcurrentConverts} conversion workers and {maxConcurrentVerifies} verification workers.");
 
-var state = stateStore.Load();
+logger.Info("Scanning FLAC files...");
+var scannedCount = 0;
+var tracks = await scanner.ScanAsync(config, cancellationToken, (count, path) =>
+{
+	scannedCount = count;
+	statusDisplay.UpdateStatus("Scanning", count, count, path);
+	statusDisplay.Render();
+}).ConfigureAwait(false);
+statusDisplay.Clear();
+
+var state = await stateStore.LoadAsync().ConfigureAwait(false);
 var stateIndex = state.Tracks.ToDictionary(entry => entry.SourcePath, StringComparer.OrdinalIgnoreCase);
+var stateIndexLock = new object();
 
 foreach (var track in tracks)
 {
@@ -87,75 +166,45 @@ if (retryFailed)
 	logger.Info("Retrying failed tracks from previous run.");
 }
 
+if (inPlace)
+{
+	logger.Warn("In-place mode enabled: MP3s will be written next to FLAC files.");
+}
+
 var estimation = estimator.Calculate(tracks, null);
 PrintSummary(tracks.Count, estimation);
 
 if (!HasEnoughFreeSpace(targetDirectory, estimation.EstimatedMp3SizeBytes + config.SafetyFreeSpaceBufferBytes))
 {
-	logger.Warn("Free space check indicates possible insufficient space.");
+	logger.Warn("⚠ Free space check indicates possible insufficient space - proceed with caution!");
 }
 
+Console.WriteLine();
 Console.Write("Proceed with migration? (y/N): ");
 var confirm = Console.ReadLine();
 if (!string.Equals(confirm, "y", StringComparison.OrdinalIgnoreCase))
 {
-	logger.Info("Cancelled by user.");
+	logger.Info("Migration cancelled by user.");
 	return;
 }
 
 var benchmarkSamples = new List<double>();
+var benchmarkLock = new object();
+var tracksToConvert = tracks.Where(t => t.Status != TrackStatus.Verified && t.Status != TrackStatus.Failed).ToList();
+var tracksToVerify = new List<TrackInfo>();
+var tracksToVerifyLock = new object();
 
-foreach (var track in tracks)
-{
-	if (track.Status == TrackStatus.Verified || track.Status == TrackStatus.Failed)
-	{
-		continue;
-	}
+logger.Info($"Starting conversion of {tracksToConvert.Count} FLAC files...");
 
-	if (track.Status != TrackStatus.Converted)
-	{
-		var conversion = await converter.ConvertAsync(track, config, cancellationToken).ConfigureAwait(false);
-		if (!conversion.Success)
-		{
-			track.Status = TrackStatus.Failed;
-			track.LastError = conversion.Error ?? "Conversion failed.";
-			UpdateState(stateIndex, track, null);
-			stateStore.Save(BuildState(stateIndex));
-			logger.Error($"Conversion failed for {track.RelativePath}: {track.LastError}");
-			continue;
-		}
+// Phase 1: Parallel conversion
+await ConvertInParallelAsync(tracksToConvert, tracksToVerifyLock, tracksToVerify, stateIndexLock, stateIndex, benchmarkLock, benchmarkSamples, statusDisplay).ConfigureAwait(false);
+statusDisplay.Clear();
 
-		track.Status = TrackStatus.Converted;
-		if (!conversion.Skipped && track.Duration.TotalSeconds > 0)
-		{
-			benchmarkSamples.Add(conversion.Elapsed.TotalSeconds / track.Duration.TotalSeconds);
-			if (benchmarkSamples.Count == 3)
-			{
-				var avg = benchmarkSamples.Average();
-				var etaEstimate = estimator.Calculate(tracks, avg);
-				if (etaEstimate.EstimatedEta.HasValue)
-				{
-					logger.Info($"ETA based on benchmark: {etaEstimate.EstimatedEta.Value:hh\\:mm\\:ss}");
-				}
-			}
-		}
-	}
+logger.Info($"Conversion complete. Starting verification of {tracksToVerify.Count} files...");
 
-	var verification = await verifier.VerifyAsync(track, config, cancellationToken).ConfigureAwait(false);
-	if (!verification.Success)
-	{
-		track.Status = TrackStatus.Failed;
-		track.LastError = verification.Error;
-		UpdateState(stateIndex, track, null);
-		stateStore.Save(BuildState(stateIndex));
-		logger.Error($"Verification failed for {track.RelativePath}: {track.LastError}");
-		continue;
-	}
-
-	track.Status = TrackStatus.Verified;
-	UpdateState(stateIndex, track, DateTime.UtcNow);
-	stateStore.Save(BuildState(stateIndex));
-}
+// Phase 2: Parallel verification
+await VerifyInParallelAsync(tracksToVerify, stateIndexLock, stateIndex, statusDisplay).ConfigureAwait(false);
+statusDisplay.Clear();
 
 if (config.DeleteVerified)
 {
@@ -166,20 +215,211 @@ else
 	logger.Info("Deletion disabled. Verified FLAC files were kept.");
 }
 
-logger.Info("Migration complete.");
+var finalStats = tracks.GroupBy(t => t.Status).ToDictionary(g => g.Key, g => g.Count());
+var verified = finalStats.GetValueOrDefault(TrackStatus.Verified, 0);
+var failed = finalStats.GetValueOrDefault(TrackStatus.Failed, 0);
+
+Console.WriteLine();
+Console.WriteLine(new string('=', 80));
+logger.Success("MIGRATION COMPLETE!");
+Console.WriteLine(new string('=', 80));
+logger.Info($"  Verified: {verified,4}");
+logger.Info($"  Converted (pending verify): {finalStats.GetValueOrDefault(TrackStatus.Converted, 0),4}");
+logger.Info($"  Failed: {failed,4}");
+logger.Info($"  Pending: {finalStats.GetValueOrDefault(TrackStatus.Pending, 0),4}");
+Console.WriteLine(new string('=', 80));
+
+if (failed > 0)
+{
+	Console.WriteLine();
+	logger.Warn($"Failed tracks ({failed}):");
+	Console.WriteLine();
+	var failedTracks = tracks.Where(t => t.Status == TrackStatus.Failed).OrderBy(t => t.RelativePath).ToList();
+	foreach (var track in failedTracks)
+	{
+		Console.ForegroundColor = ConsoleColor.Red;
+		Console.WriteLine($"  X {track.RelativePath}");
+		Console.ResetColor();
+		Console.WriteLine($"    Reason: {track.LastError}");
+	}
+	Console.WriteLine();
+	
+	await errorReporter.GenerateReportAsync().ConfigureAwait(false);
+	logger.Info("See migration_errors.log for detailed error information.");
+}
+else
+{
+	logger.Success("No errors - all tracks migrated successfully!");
+}
 
 void PrintUsage()
 {
-	Console.WriteLine("Usage: FlacMigratorLite <sourceDir> <targetDir> [--delete] [--retry-failed]");
+	Console.WriteLine("Usage:");
+	Console.WriteLine("  FlacMigratorLite <sourceDir> [<targetDir>] [options]");
+	Console.WriteLine("  FlacMigratorLite --source <sourceDir> [--target <targetDir>] [options]");
+	Console.WriteLine();
+	Console.WriteLine("Options:");
+	Console.WriteLine("  --in-place        Write MP3s next to FLACs and delete after verification");
+	Console.WriteLine("  --delete          Delete verified FLAC files (default: keep them)");
+	Console.WriteLine("  --retry-failed    Retry tracks that failed in a previous run");
 }
 
 void PrintSummary(int totalFiles, EstimationResult estimation)
 {
-	logger.Info($"Files: {totalFiles}");
-	logger.Info($"Total size: {FormatBytes(estimation.TotalSizeBytes)}");
-	logger.Info($"Total duration: {estimation.TotalDuration:hh\\:mm\\:ss}");
-	logger.Info($"Estimated MP3 size: {FormatBytes(estimation.EstimatedMp3SizeBytes)}");
-	logger.Info($"Estimated compression: {estimation.EstimatedCompressionRatio:P0}");
+	Console.WriteLine();
+	Console.WriteLine(new string('-', 80));
+	logger.Info("Migration Estimate:");
+	Console.WriteLine(new string('-', 80));
+	logger.Info($"  Total files: {totalFiles}");
+	logger.Info($"  Total size: {FormatBytes(estimation.TotalSizeBytes)}");
+	logger.Info($"  Total duration: {estimation.TotalDuration:hh\\:mm\\:ss}");
+	logger.Info($"  Estimated MP3 size: {FormatBytes(estimation.EstimatedMp3SizeBytes)}");
+	logger.Info($"  Estimated compression: {estimation.EstimatedCompressionRatio:P0}");
+	Console.WriteLine(new string('-', 80));
+}
+
+async Task ConvertInParallelAsync(List<TrackInfo> tracksToConvert, object verifyLock, List<TrackInfo> tracksToVerify, object stateLock, Dictionary<string, TrackStateEntry> stateIndex, object benchLock, List<double> benchmarkSamples, StatusDisplay statusDisplay)
+{
+	var convertWorker = new WorkerQueue<TrackInfo>(
+		maxConcurrentConverts,
+		async (track, ct) =>
+		{
+			if (track.Status == TrackStatus.Converted)
+			{
+				return;
+			}
+
+			var conversion = await converter.ConvertAsync(track, config, ct).ConfigureAwait(false);
+			if (!conversion.Success)
+			{
+				track.Status = TrackStatus.Failed;
+				track.LastError = conversion.Error ?? "Conversion failed.";
+				errorReporter.RecordError(track.SourcePath, track.RelativePath, track.LastError ?? "Conversion failed.", TrackStatus.Failed);
+				lock (stateLock)
+				{
+					UpdateState(stateIndex, track, null);
+				}
+				await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
+				logger.Error($"Conversion failed for {track.RelativePath}");
+				logger.Error($"  Reason: {track.LastError}");
+				return;
+			}
+
+			track.Status = TrackStatus.Converted;
+			if (!conversion.Skipped && track.Duration.TotalSeconds > 0)
+			{
+				lock (benchLock)
+				{
+					benchmarkSamples.Add(conversion.Elapsed.TotalSeconds / track.Duration.TotalSeconds);
+					if (benchmarkSamples.Count == 3)
+					{
+						var avg = benchmarkSamples.Average();
+						var etaEstimate = estimator.Calculate(tracks, avg);
+						if (etaEstimate.EstimatedEta.HasValue)
+						{
+							logger.Progress($"ETA based on benchmark: {etaEstimate.EstimatedEta.Value:hh\\:mm\\:ss}");
+						}
+					}
+				}
+			}
+
+			lock (verifyLock)
+			{
+				tracksToVerify.Add(track);
+			}
+		},
+		logger
+	);
+
+	// Start background task to display progress
+	var displayTask = Task.Run(async () =>
+	{
+		while (true)
+		{
+			var (processed, total) = convertWorker.GetProgress();
+			if (total > 0 && processed < total)
+			{
+				var currentTrack = tracksToConvert.FirstOrDefault(t => t.Status == TrackStatus.Pending);
+				var jobName = currentTrack?.RelativePath ?? "idle";
+				statusDisplay.UpdateStatus("Converting", processed, total, jobName);
+				statusDisplay.Render();
+			}
+
+			if (processed >= total && total > 0)
+			{
+				break;
+			}
+
+			await Task.Delay(500).ConfigureAwait(false);
+		}
+	});
+
+	await convertWorker.ProcessAsync(tracksToConvert, cancellationToken).ConfigureAwait(false);
+	await displayTask.ConfigureAwait(false);
+}
+
+async Task VerifyInParallelAsync(List<TrackInfo> tracksToVerify, object stateLock, Dictionary<string, TrackStateEntry> stateIndex, StatusDisplay statusDisplay)
+{
+	var verifyWorker = new WorkerQueue<TrackInfo>(
+		maxConcurrentVerifies,
+		async (track, ct) =>
+		{
+			if (track.Status == TrackStatus.Verified)
+			{
+				return;
+			}
+
+			var verification = await verifier.VerifyAsync(track, config, ct).ConfigureAwait(false);
+			if (!verification.Success)
+			{
+				track.Status = TrackStatus.Failed;
+				track.LastError = verification.Error;
+				errorReporter.RecordError(track.SourcePath, track.RelativePath, track.LastError ?? "Verification failed.", TrackStatus.Failed);
+				lock (stateLock)
+				{
+					UpdateState(stateIndex, track, null);
+				}
+				await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
+				logger.Error($"Verification failed for {track.RelativePath}");
+				logger.Error($"  Reason: {track.LastError}");
+				return;
+			}
+
+			track.Status = TrackStatus.Verified;
+			lock (stateLock)
+			{
+				UpdateState(stateIndex, track, DateTime.UtcNow);
+			}
+			await stateStore.SaveAsync(BuildState(stateIndex)).ConfigureAwait(false);
+		},
+		logger
+	);
+
+	// Start background task to display progress
+	var displayTask = Task.Run(async () =>
+	{
+		while (true)
+		{
+			var (processed, total) = verifyWorker.GetProgress();
+			if (total > 0 && processed < total)
+			{
+				var currentTrack = tracksToVerify.FirstOrDefault(t => t.Status == TrackStatus.Converted);
+				var jobName = currentTrack?.RelativePath ?? "idle";
+				statusDisplay.UpdateStatus("Verifying", processed, total, jobName);
+				statusDisplay.Render();
+			}
+
+			if (processed >= total && total > 0)
+			{
+				break;
+			}
+
+			await Task.Delay(500).ConfigureAwait(false);
+		}
+	});
+
+	await verifyWorker.ProcessAsync(tracksToVerify, cancellationToken).ConfigureAwait(false);
+	await displayTask.ConfigureAwait(false);
 }
 
 bool HasEnoughFreeSpace(string targetDir, long requiredBytes)
@@ -240,3 +480,4 @@ string FormatBytes(long bytes)
 
 	return $"{len:0.##} {sizes[order]}";
 }
+

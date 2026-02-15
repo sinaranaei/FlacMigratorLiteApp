@@ -18,14 +18,16 @@ public class ScannerService
         _logger = logger;
     }
 
-    public async Task<List<TrackInfo>> ScanAsync(MigrationConfig config, CancellationToken cancellationToken)
+    public async Task<List<TrackInfo>> ScanAsync(MigrationConfig config, CancellationToken cancellationToken, Action<int, string>? progressCallback = null)
     {
         var tracks = new List<TrackInfo>();
         var files = Directory.EnumerateFiles(config.SourceDirectory, "*.*", SearchOption.AllDirectories)
             .Where(path => path.EndsWith(".flac", StringComparison.OrdinalIgnoreCase));
 
-        foreach (var file in files)
+        var fileList = files.ToList();
+        for (var i = 0; i < fileList.Count; i++)
         {
+            var file = fileList[i];
             var duration = await ProbeDurationAsync(config, file, cancellationToken).ConfigureAwait(false);
             var relative = Path.GetRelativePath(config.SourceDirectory, file);
             var target = Path.Combine(config.TargetDirectory, Path.ChangeExtension(relative, ".mp3"));
@@ -43,6 +45,12 @@ public class ScannerService
                 Status = duration == TimeSpan.Zero ? TrackStatus.Failed : TrackStatus.Pending,
                 LastError = duration == TimeSpan.Zero ? "Duration probe failed." : null
             });
+
+            // Report progress every 10 files or at the end
+            if (i % 10 == 0 || i == fileList.Count - 1)
+            {
+                progressCallback?.Invoke(i + 1, relative);
+            }
         }
 
         _logger.Info($"Found {tracks.Count} FLAC files.");

@@ -29,16 +29,28 @@ dotnet build
 
 ```powershell
 dotnet run --project FlacMigratorLite -- "<sourceDir>" "<targetDir>" [--delete] [--retry-failed]
+dotnet run --project FlacMigratorLite -- "<sourceDir>" --in-place [--delete] [--retry-failed]
+dotnet run --project FlacMigratorLite -- --source "<sourceDir>" --target "<targetDir>" [--delete] [--retry-failed]
+dotnet run --project FlacMigratorLite -- --source "<sourceDir>" --in-place [--delete] [--retry-failed]
 ```
 
-Example:
+Example (positional):
 
 ```powershell
 dotnet run --project FlacMigratorLite -- "C:\TestFlacConvert" "D:\TestFlacConvertMp3" --delete --retry-failed
 ```
 
+Example (named flags):
+
+```powershell
+dotnet run --project FlacMigratorLite -- --source "C:\TestFlacConvert" --in-place --delete --retry-failed
+```
+
 ### Flags
 
+- `--source <dir>` source directory (can also be positional; first argument)
+- `--target <dir>` target directory (can also be positional; second argument if not using `--in-place`)
+- `--in-place` write MP3s next to FLACs and use the source directory as the target
 - `--delete` delete verified FLAC files after the full pass
 - `--retry-failed` reprocess tracks that previously failed
 
@@ -56,6 +68,7 @@ dotnet run --project FlacMigratorLite -- "C:\TestFlacConvert" "D:\TestFlacConver
 ## Safety notes
 
 - No in-place overwrites
+- In-place mode writes MP3s next to FLACs and deletes FLACs only after verification
 - No deletion before verification
 - Uses a state file to resume after a crash
 - Uses a temporary output file and then renames on success
