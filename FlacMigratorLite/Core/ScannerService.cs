@@ -26,7 +26,9 @@ public class ScannerService
 
         var fileList = files.ToList();
         var tracksLock = new object();
-        var maxParallelProbes = Math.Max(2, Environment.ProcessorCount / 2); // Use 1/2 of CPU cores for aggressive probing
+        var maxParallelProbes = config.ScanWorkers > 0
+            ? config.ScanWorkers
+            : Math.Max(2, Environment.ProcessorCount / 2); // Default to 1/2 of CPU cores for probing
 
         // Batch files for more efficient probing (8 files per batch)
         const int FilesPerBatch = 8;
@@ -158,6 +160,14 @@ public class ScannerService
         if (double.TryParse(result.StdOut.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds) && seconds > 0)
         {
             return TimeSpan.FromSeconds(seconds);
+        }
+
+        // Fallback: try audio stream duration when container duration is missing
+        var streamArgs = $"-v error -select_streams a:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 \"{filePath}\"";
+        var streamResult = await _runner.RunAsync(config.FfprobePath, streamArgs, null, config.FfprobeTimeoutSeconds, cancellationToken).ConfigureAwait(false);
+        if (streamResult.IsSuccess && double.TryParse(streamResult.StdOut.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var streamSeconds) && streamSeconds > 0)
+        {
+            return TimeSpan.FromSeconds(streamSeconds);
         }
 
         _logger.Warn($"Unable to parse duration for {filePath}.");

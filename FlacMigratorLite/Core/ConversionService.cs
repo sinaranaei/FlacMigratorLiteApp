@@ -37,10 +37,17 @@ public class ConversionService
             File.Delete(tempPath);
         }
 
-        var args = string.Join(' ', new[]
+        var argsParts = new List<string>
         {
             "-y",
-            $"-i \"{track.SourcePath}\"",
+            $"-i \"{track.SourcePath}\""
+        };
+        if (config.FfmpegThreads > 0)
+        {
+            argsParts.Add($"-threads {config.FfmpegThreads}");
+        }
+        argsParts.AddRange(new[]
+        {
             "-map 0",
             "-map_metadata 0",
             "-c:a libmp3lame",
@@ -51,6 +58,7 @@ public class ConversionService
             "-f mp3",
             $"\"{tempPath}\""
         });
+        var args = string.Join(' ', argsParts);
 
         var stopwatch = Stopwatch.StartNew();
         var result = await _runner.RunAsync(config.FfmpegPath, args, null, config.FfmpegTimeoutSeconds, cancellationToken).ConfigureAwait(false);

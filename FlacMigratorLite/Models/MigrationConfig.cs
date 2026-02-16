@@ -7,6 +7,8 @@ public class MigrationConfig
     public string TargetDirectory { get; init; } = string.Empty;
     public string FfmpegPath { get; init; } = "ffmpeg";
     public string FfprobePath { get; init; } = "ffprobe";
+    public int FfmpegThreads { get; init; } = 0;
+    public int ScanWorkers { get; init; } = 0;
     public string StateFilePath { get; init; } = "migration_state.json";
     public bool DeleteVerified { get; init; } = true;
     public int Mp3BitrateKbps { get; init; } = 320;

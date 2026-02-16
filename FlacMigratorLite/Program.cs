@@ -10,6 +10,9 @@ var inPlace = normalizedArgs.Any(arg => string.Equals(arg, "--in-place", StringC
 var deleteVerified = normalizedArgs.Any(arg => string.Equals(arg, "--delete", StringComparison.OrdinalIgnoreCase));
 var retryFailed = normalizedArgs.Any(arg => string.Equals(arg, "--retry-failed", StringComparison.OrdinalIgnoreCase));
 var fullVerify = normalizedArgs.Any(arg => string.Equals(arg, "--full-verify", StringComparison.OrdinalIgnoreCase));
+var extremeMode = normalizedArgs.Any(arg => string.Equals(arg, "--extreme", StringComparison.OrdinalIgnoreCase));
+int? convertWorkersOverride = null;
+int? ffmpegThreadsOverride = null;
 
 // Parse named flags
 string? sourceDirectory = null;
@@ -24,6 +27,30 @@ for (int i = 0; i < normalizedArgs.Length; i++)
 	else if (string.Equals(normalizedArgs[i], "--target", StringComparison.OrdinalIgnoreCase) && i + 1 < normalizedArgs.Length)
 	{
 		targetDirectory = normalizedArgs[++i];
+	}
+	else if (string.Equals(normalizedArgs[i], "--convert-workers", StringComparison.OrdinalIgnoreCase) && i + 1 < normalizedArgs.Length)
+	{
+		if (int.TryParse(normalizedArgs[++i], out var value) && value > 0)
+		{
+			convertWorkersOverride = value;
+		}
+		else
+		{
+			logger.Error("--convert-workers must be a positive integer.");
+			return;
+		}
+	}
+	else if (string.Equals(normalizedArgs[i], "--ffmpeg-threads", StringComparison.OrdinalIgnoreCase) && i + 1 < normalizedArgs.Length)
+	{
+		if (int.TryParse(normalizedArgs[++i], out var value) && value > 0)
+		{
+			ffmpegThreadsOverride = value;
+		}
+		else
+		{
+			logger.Error("--ffmpeg-threads must be a positive integer.");
+			return;
+		}
 	}
 }
 
@@ -98,12 +125,30 @@ if (string.IsNullOrEmpty(targetDirectory))
 
 Directory.CreateDirectory(targetDirectory);
 
+// Determine concurrency level based on CPU cores - quality-first with optimization
+var processorCount = Environment.ProcessorCount;
+var maxConcurrentConverts = Math.Max(2, (int)(processorCount * 0.75)); // 75% of cores for conversion
+var maxConcurrentVerifies = Math.Max(2, processorCount); // Full cores for verification (lighter I/O)
+var scanWorkers = Math.Max(2, processorCount / 2);
+if (extremeMode)
+{
+	maxConcurrentConverts = processorCount;
+	maxConcurrentVerifies = processorCount;
+	scanWorkers = processorCount;
+}
+if (convertWorkersOverride.HasValue)
+{
+	maxConcurrentConverts = convertWorkersOverride.Value;
+}
+
 var config = new MigrationConfig
 {
 	SourceDirectory = sourceDirectory,
 	TargetDirectory = targetDirectory,
 	StateFilePath = Path.Combine(targetDirectory, "migration_state.json"),
-	DeleteVerified = deleteVerified
+	DeleteVerified = deleteVerified,
+	FfmpegThreads = ffmpegThreadsOverride ?? 0,
+	ScanWorkers = scanWorkers
 };
 
 var runner = new ProcessRunner();
@@ -118,12 +163,15 @@ var errorReporter = new ErrorReporter(
     logger
 );
 var cancellationToken = CancellationToken.None;
-
-// Determine concurrency level based on CPU cores - quality-first with optimization
-var processorCount = Environment.ProcessorCount;
-var maxConcurrentConverts = Math.Max(2, (int)(processorCount * 0.75)); // 75% of cores for conversion
-var maxConcurrentVerifies = Math.Max(2, processorCount); // Full cores for verification (lighter I/O)
-logger.Info($"Using {maxConcurrentConverts} conversion workers and {maxConcurrentVerifies} verification workers.");
+logger.Info($"Using {scanWorkers} scan workers, {maxConcurrentConverts} conversion workers, and {maxConcurrentVerifies} verification workers.");
+if (extremeMode)
+{
+	logger.Warn("Extreme mode enabled: using all CPU cores for scan, conversion, and verification.");
+}
+if (ffmpegThreadsOverride.HasValue)
+{
+	logger.Info($"Using {ffmpegThreadsOverride.Value} ffmpeg threads per conversion.");
+}
 
 logger.Info("Scanning FLAC files...");
 var scanStopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -275,6 +323,9 @@ void PrintUsage()
 	Console.WriteLine("  --delete          Delete verified FLAC files (default: keep them)");
 	Console.WriteLine("  --retry-failed    Retry tracks that failed in a previous run");
 	Console.WriteLine("  --full-verify     Decode entire MP3 to verify integrity (much slower)");
+	Console.WriteLine("  --extreme         Use all CPU cores for scan/convert/verify");
+	Console.WriteLine("  --convert-workers <n>  Override conversion worker count");
+	Console.WriteLine("  --ffmpeg-threads <n>   Threads per ffmpeg process (1-4 typical)");
 }
 
 void PrintSummary(int totalFiles, EstimationResult estimation, bool fullVerify = false)
@@ -289,13 +340,13 @@ void PrintSummary(int totalFiles, EstimationResult estimation, bool fullVerify =
 	
 	if (fullVerify)
 	{
-		// Full decode test: assume ~0.8-1.0x speed again
-		estimatedVerifyTime = TimeSpan.FromSeconds(estimation.TotalDuration.TotalSeconds * 0.9);
+		// Full decode test: playing through entire audio = approximately same duration
+		estimatedVerifyTime = estimation.TotalDuration;
 		verifyMode = "full decode (integrity check)";
 	}
 	else
 	{
-		// Fast duration-only: assume ~15-30 seconds for all
+		// Fast duration-only: just ffprobe checks, very fast (~15-30 seconds for all)
 		estimatedVerifyTime = TimeSpan.FromSeconds(Math.Min(30, totalFiles / 100.0));
 		verifyMode = "duration check only";
 	}
